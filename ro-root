@@ -1,0 +1,272 @@
+#!/bin/sh
+#  Copyright, 2012 Axel Heider
+#             2016 Tiago Marques
+#
+#  Based on scripts from
+#    Sebastian P.
+#    Nicholas A. Schembri State College PA USA
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see
+#    <http://www.gnu.org/licenses/>.
+#
+# Notes:
+#   * no changes to the root fs are made by this script. 
+#   * if /home/[user] is on the RO root fs, files are in ram and not saved.
+#
+# Install:
+#  put this file in /etc/initramfs-tools/scripts/init-bottom/ro-root
+#  chmod 0755 ro-root
+#  optional: clean up menu.lst, update-grub
+#  update-initramfs -u
+#
+# Disable read-only root fs
+#   * option 1: kernel boot parameter "rw-root=true"
+#   * option 2: create file "/rw-root"
+#
+# RO_DRIVER variable controls which driver isused for the ro/rw layering
+#   Supported drivers are: overlayfs, aufs
+#  the kernel parameter "ro-driver=[driver]" can be used to initialize
+#  the variable RO_DRIVER. If nothing is given, Overlay FS is used.
+#
+
+# no pre requirement
+PREREQ=""
+
+prereqs()
+{
+    echo "${PREREQ}"
+}
+
+case "$1" in
+    prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+. /scripts/functions
+
+MYTAG="RO-Root"
+DISABLE_MAGIC_FILE="/rw-root"
+
+ROOT_MNT=${rootmnt}
+
+# parse kernel boot command line 
+RO_DRIVER=
+RW_ROOT=
+for CMD_PARAM in $(cat /proc/cmdline); do 
+    case ${CMD_PARAM} in 
+        rw-root=*)
+            RW_ROOT=${CMD_PARAM#rw-root=}
+            ;;
+        ro-driver=*)
+            RO_DRIVER=${CMD_PARAM#ro-driver=}
+            ;;
+    esac
+done
+
+# check if read-only root fs is disabled
+if [ ! -z "${RW_ROOT}" ]; then
+    log_warning_msg "'${MYTAG}' disabled, mounting as RW."
+    exit 0
+fi
+if [ -e "${ROOT_MNT}${DISABLE_MAGIC_FILE}" ]; then
+    log_warning_msg "'${MYTAG}' disabled, found file '${DISABLE_MAGIC_FILE}'."
+    exit 0
+fi
+
+# ${ROOT} and ${ROOT_MNT} are predefined by caller of this script. Note that
+# the root fs ${ROOT_MNT} it mounted readonly on the initrams, which fits nicely
+# for our purposes.
+ROOT_RO=/mnt/root
+ROOT_RW=/mnt/root-rw
+UPPERDIR=$ROOT_RW/upper
+WORKDIR=$ROOT_RW/work
+
+# Make the mount point on the initial root fs ${ROOT_RO}
+[ -d ${ROOT_RO} ] || mkdir -p ${ROOT_RO}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to create ${ROOT_RO}"
+    exit 0
+fi
+
+# Make the mount point on the init root fs ${ROOT_RW}
+[ -d ${ROOT_RW} ] || mkdir -p ${ROOT_RW}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to create ${ROOT_RW}"
+    exit 0
+fi
+
+# Mount a tmpfs using the device name tmpfs-root at ${ROOT_RW}
+mount -t tmpfs tmpfs-root -o mode=0755 ${ROOT_RW}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to create tmpfs."
+    exit 0
+fi
+
+# Default RO driver to use.
+if [ -z "${RO_DRIVER}" ]; then
+    RO_DRIVER=overlayfs
+fi
+# Settings based in ${RO_DRIVER}, stop here if unsupported. 
+case ${RO_DRIVER} in
+    overlayfs)
+        MOUNT_PARMS="-t overlayfs -o lowerdir=${ROOT_RO},upperdir=${UPPERDIR},workdir=${WORKDIR} overlayfs-root ${ROOT_MNT}"
+	# Create 'WORKDIR'.
+	[ -d ${WORKDIR} ] || mkdir -p ${WORKDIR}
+	if [ $? -ne 0 ]; then
+	    log_failure_msg "${MYTAG} ERROR: Failed to create 'work' - ${WORKDIR}"
+	    exit 0
+	fi
+	# Create 'UPPERDIR'.
+	[ -d ${UPPERDIR} ] || mkdir -p ${UPPERDIR}
+	if [ $? -ne 0 ]; then
+	    log_failure_msg "${MYTAG} ERROR: Failed to create 'upper' - ${UPPERDIR}"
+	    exit 0
+	fi
+        ;;
+    aufs)
+        MOUNT_PARMS="-t aufs -o dirs=${ROOT_RW}:${ROOT_RO}=ro aufs-root ${ROOT_MNT}"
+        ;;
+    *)
+        panic "${MYTAG} ERROR: invalide RO_DRIVER ${RO_DRIVER}"
+        ;;
+esac
+
+# check if kernel module exists 
+modprobe -qb ${RO_DRIVER}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: missing kernel module ${RO_DRIVER}"
+    exit 0
+fi
+
+# 'root' is mounted on ${ROOT_MNT}, move it to ${ROOT_RO}.
+mount --move ${ROOT_MNT} ${ROOT_RO}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to move root away from ${ROOT_MNT} to ${ROOT_RO}"
+    exit 0
+fi
+
+############################################################
+# Fix a bug with permissions on ${ROOT_RO}. 3 steps:
+mount -o remount,rw ${ROOT_RO};
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to remount real root as RW."
+    exit 0
+fi
+# Now we can run 'chmod'.
+chmod 0755 ${ROOT_RO};
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to 'chmod 0755' on real root."
+    exit 0
+fi
+# We're now RO again.
+mount -o remount,ro ${ROOT_RO};
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to remount real root as RW."
+    exit 0
+fi
+############################################################
+
+# There is nothing left at ${ROOT_MNT} now. So for any error we get we should
+# either do recovery to restore ${ROOT_MNT} for drop to a initramfs shell using
+# "panic". Otherwise the boot process is very likely to fail with even more 
+# errors and leave the system in a wired state. 
+
+# mount virtual FS ${ROOT_MNT} as RW at ${ROOT_RW} on top or RO at ${ROOT_RO}.
+mount ${MOUNT_PARMS}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to create new ro/rw layerd ${ROOT_MNT}"
+    # do recovery and try resorting the mount for ${ROOT_MNT}
+    mount --move ${ROOT_RO} ${ROOT_MNT}
+    if [ $? -ne 0 ]; then
+       # This is bad. Drop to a shell to let the user try to fix this.
+       panic "${MYTAG} RECOVERY ERROR: Failed to move ${ROOT_RO} back to ${ROOT_MNT}"
+    fi
+    exit 0
+fi
+
+# Now the real root FS is on ${ROOT_RO} of the init file system, our layered
+# root FS is set up at ${ROOT_MNT}. So we can write anywhere in {ROOT_MNT} and the
+# changes will end up in ${ROOT_RW} while ${ROOT_RO} it not touched. However 
+# ${ROOT_RO} and ${ROOT_RW} are on the initramfs root fs, which will be removed
+# an replaced by ${ROOT_MNT}. Thus we must move ${ROOT_RO} and ${ROOT_RW} to the
+# rootfs visible later, ie. ${ROOT_MNT}${ROOT_RO} and ${ROOT_MNT}${ROOT_RO}.
+# Since the layered RO/RW is already up, these changes also end up on 
+# ${ROOT_RW} while ${ROOT_RO} is not touched.
+
+# Move mount from ${ROOT_RO} to ${ROOT_MNT}${ROOT_RO}
+[ -d ${ROOT_MNT}${ROOT_RO} ] || mkdir -p ${ROOT_MNT}${ROOT_RO}
+mount --move ${ROOT_RO} ${ROOT_MNT}${ROOT_RO}
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to move ${ROOT_RO} to ${ROOT_MNT}${ROOT_RO}"
+    exit 0
+fi
+
+# Move mount from ${ROOT_RW} to ${ROOT_MNT}${ROOT_RW} 
+[ -d ${ROOT_MNT}${ROOT_RW} ] || mkdir -p ${ROOT_MNT}${ROOT_RW}
+mount --move ${ROOT_RW} ${ROOT_MNT}${ROOT_RW}
+if [ $? -ne 0 ]; then
+    s "${MYTAG}: ERROR: Failed to move ${ROOT_RW} to ${ROOT_MNT}${ROOT_RW}"
+    exit 0
+fi
+
+# technically, everything is set up nicely now. Since ${ROOT_MNT} had beend 
+# mounted read-only on the initfamfs already, ${ROOT_MNT}${ROOT_RO} is it, too.
+# Now we init process could run - but unfortunately, we may have to prepare 
+# some more things here. 
+# Basically, there are two ways to deal with the read-only root fs. If the 
+# system is made aware of this, things can be simplified a lot.
+# If it is not, things need to be done to our best knowledge. 
+#
+# So we assume here, the system does not really know about our read-only root fs.
+#
+# Let's deal with /etc/fstab first. It usually contains an entry for the root 
+# fs, which is no longer valid now. We have to remove it and add our new 
+# ${ROOT_RO} entry. 
+# Remember we are still on the initramfs root fs here, so we have to work on
+# ${ROOT_MNT}/etc/fstab. The original fstab is ${ROOT_MNT}${ROOT_RO}/etc/fstab.
+ROOT_TYPE=$(cat /proc/mounts | grep ${ROOT} | cut -d' ' -f3)
+ROOT_OPTIONS=$(cat /proc/mounts | grep ${ROOT} | cut -d' ' -f4)
+cat <<EOF >${ROOT_MNT}/etc/fstab
+#
+#  This fstab is in RAM, the real one can be found at ${ROOT_RO}/etc/fstab
+#  The original entry for '/' and all swap files have been removed.  The new 
+#  entry for the read-only the real root fs follows. Write access can be 
+#  enabled using:
+#    sudo mount -o remount,rw ${ROOT_RO}
+#  re-mounting it read-only is done using:
+#    sudo mount -o remount,ro ${ROOT_RO}
+#
+${ROOT} ${ROOT_RO} ${ROOT_TYPE} ${ROOT_OPTIONS} 0 0
+#
+EOF
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to modify /etc/fstab (step 1)"
+    #exit 0
+fi
+
+# Remove 'root' entry and swap from fstab
+cat ${ROOT_MNT}${ROOT_RO}/etc/fstab | grep -v ' / ' | grep -v swap >> ${ROOT_MNT}/etc/fstab
+if [ $? -ne 0 ]; then
+    log_failure_msg "${MYTAG} ERROR: Failed to modify etc/fstab (step 2)"
+    #exit 0
+fi
+
+# Done. Additinal steps may be necessary depending on the actual
+# distribution and configuration.
+
+log_success_msg "Set up RO root FS using '${RO_DRIVER}'."
+
+exit 0
