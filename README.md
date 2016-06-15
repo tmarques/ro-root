@@ -1,7 +1,7 @@
 # Description
 These scripts provide for support for a RAM drive based ROOT FS on Ubuntu and 
 other Linux distributions. It is based on the script found on Ubuntu Forums
-(http://ubuntuforums.org/showthread.php?t=853701&page=3).
+(http://ubuntuforums.org/showthread.php?t=853701).
 
 This fixes some issues, like 1777 permissions on RW root, though the script
 still replaces some mount options on the modified 'fstab'.
